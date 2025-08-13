@@ -16,3 +16,7 @@ venv/
 
 # Outputs
 outputs/
+
+# Other
+words*.txt
+.DS_Store
