@@ -4,6 +4,8 @@ import sys
 import time
 import re
 import csv
+import logging
+import json
 from typing import List, Tuple, Optional, Dict
 from urllib.parse import urljoin
 
@@ -27,6 +29,50 @@ COLLOCATIONS_LIMIT_PER_WORD = 8
 
 # Debug logging toggle
 DEBUG = os.getenv("DEBUG_COLL", "0").lower() in ("1", "true", "yes", "on")
+
+# Persistent action logger configuration
+_LOGGER = None
+LOG_FILE_PATH = os.getenv("COLL_LOG_FILE", os.path.join(".", "outputs", "collocations.log"))
+
+
+class _WordContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "word"):
+            record.word = "-"
+        return True
+
+
+def _get_logger() -> logging.Logger:
+    global _LOGGER
+    if _LOGGER is not None:
+        return _LOGGER
+    logger = logging.getLogger("collocations")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        try:
+            os.makedirs(os.path.dirname(LOG_FILE_PATH), exist_ok=True)
+        except Exception:
+            pass
+        fh = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+        fmt = logging.Formatter("%(asctime)s %(levelname)s [PID:%(process)d %(word)s] %(message)s")
+        fh.setFormatter(fmt)
+        fh.addFilter(_WordContextFilter())
+        logger.addHandler(fh)
+    _LOGGER = logger
+    return logger
+
+
+def log_event(word: str, action: str, **kwargs: object) -> None:
+    """Log a structured action event for a given base word to the persistent logfile."""
+    logger = _get_logger()
+    payload: Dict[str, object] = {"action": action, **kwargs}
+    try:
+        msg = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        msg = str(payload)
+    logger.info(msg, extra={"word": word})
+
 
 def debug_log(message: str) -> None:
     if DEBUG:
@@ -137,6 +183,7 @@ def write_collocations_to_file(word: str, collocations: List[Tuple[str, int, Opt
         for phrase, frequency, _ in collocations_sorted:
             f.write(f"{phrase}\t{frequency}\n")
 
+    log_event(word, "write_collocations_file", count=len(collocations_sorted), path=output_path)
     return output_path
 
 
@@ -252,6 +299,7 @@ Meaning of formal_only:
 def filter_collocations_with_gpt(word: str, collocations: List[Tuple[str, int, Optional[str]]]) -> List[Tuple[str, int, Optional[str]]]:
     if OpenAI is None or not collocations or not OPENAI_API_KEY:
         debug_log(f"filter_collocations_with_gpt: skipping. OpenAI_present={OpenAI is not None}, collocations={len(collocations)}, has_api_key={bool(OPENAI_API_KEY)}")
+        log_event(word, "gpt_filter_skipped", openai_present=OpenAI is not None, collocations=len(collocations), has_api_key=bool(OPENAI_API_KEY))
         return collocations
     client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -260,12 +308,11 @@ def filter_collocations_with_gpt(word: str, collocations: List[Tuple[str, int, O
     debug_log(f"filter_collocations_with_gpt: model={OPENAI_MODEL}, num_phrases={len(phrases)}, sys_len={len(messages[0]['content']) if messages else 0}, user_len={len(messages[-1]['content']) if messages else 0}")
 
     def try_once() -> Optional[List[Dict[str, object]]]:
-        text = attempt_responses(client, messages, reasoning_effort="medium")
+        text = attempt_responses(client, messages, reasoning_effort="medium", context_word=word)
         debug_log(f"filter_collocations_with_gpt: try_once text_len={len(text) if text else 0}")
         if not text:
             return None
         try:
-            import json
             data = json.loads(text)
             if isinstance(data, list):
                 return data
@@ -277,10 +324,9 @@ def filter_collocations_with_gpt(word: str, collocations: List[Tuple[str, int, O
     data = try_once()
     if data is None:
         strict = messages + [{"role": "user", "content": "Return ONLY a valid JSON array with objects: {phrase:string,british:boolean,formal_only:boolean}"}]
-        text2 = attempt_responses(client, strict, reasoning_effort="medium")
+        text2 = attempt_responses(client, strict, reasoning_effort="medium", context_word=word)
         debug_log(f"filter_collocations_with_gpt: retry text_len={len(text2) if text2 else 0}")
         try:
-            import json
             data = json.loads(text2) if text2 else None
         except Exception as e:
             debug_log(f"filter_collocations_with_gpt: JSON parse error on retry: {e}")
@@ -288,6 +334,7 @@ def filter_collocations_with_gpt(word: str, collocations: List[Tuple[str, int, O
 
     if not isinstance(data, list):
         debug_log("filter_collocations_with_gpt: no valid decisions, returning original collocations")
+        log_event(word, "gpt_filter_no_valid_decisions", original_count=len(collocations))
         return collocations
 
     decisions_brit: Dict[str, bool] = {}
@@ -303,13 +350,14 @@ def filter_collocations_with_gpt(word: str, collocations: List[Tuple[str, int, O
         decisions_formal_only[key] = formal_only
 
     # lightweight visibility of decisions
-    print({
+    decisions_map = {
         k: {
             "british": decisions_brit.get(k, False),
             "formal_only": decisions_formal_only.get(k, False),
         }
         for k in set(decisions_brit) | set(decisions_formal_only)
-    })
+    }
+    log_event(word, "gpt_filter_decisions", decisions=decisions_map)
 
     filtered: List[Tuple[str, int, Optional[str]]] = []
     brit_true = 0
@@ -327,6 +375,7 @@ def filter_collocations_with_gpt(word: str, collocations: List[Tuple[str, int, O
         filtered.append((phrase, freq, url))
 
     debug_log(f"filter_collocations_with_gpt: decisions={len(decisions_brit)}, brit_true={brit_true}, formal_only_true={formal_true}, kept={len(filtered)} of {len(collocations)}")
+    log_event(word, "gpt_filter_summary", decisions=len(decisions_brit), brit_true=brit_true, formal_true=formal_true, kept=len(filtered), original=len(collocations))
     return filtered
 
 
@@ -383,32 +432,55 @@ def _collocation_in_order(sentence: str, phrase: str, target_word: str) -> bool:
 
 
 # Helper to call the Responses API consistently
-def attempt_responses(client: OpenAI, messages: List[Dict[str, str]], reasoning_effort: str = "minimal", gpt_model: str = OPENAI_MODEL) -> str:
-    try:
-        sys_prompt = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
-        user_prompt = messages[-1]["content"] if messages else ""
-        composed = (sys_prompt + "\n\n" + user_prompt).strip()
-        debug_log(f"attempt_responses: model={gpt_model}, effort={reasoning_effort}")
-        debug_log(f"attempt_responses: sys_len={len(sys_prompt)}, user_len={len(user_prompt)}, composed_len={len(composed)}")
-        resp = client.responses.create(model=gpt_model, input=composed, reasoning={"effort": reasoning_effort})
-        debug_log(f"attempt_responses: raw_response={resp}")
-        text = getattr(resp, "output_text", None) or ""
-        if not text and hasattr(resp, "output"):
-            try:
-                parts = []
-                for item in resp.output:  # type: ignore[attr-defined]
-                    if hasattr(item, "content"):
-                        for c in item.content:  # type: ignore[attr-defined]
-                            if hasattr(c, "text") and hasattr(c.text, "value"):
-                                parts.append(c.text.value)
-                text = "".join(parts)
-            except Exception:
-                text = ""
-        debug_log(f"attempt_responses: text_len={len(text) if text else 0}")
-        return text.strip()
-    except Exception as e:
-        debug_log(f"attempt_responses: error={e}")
-        return ""
+def attempt_responses(client: OpenAI, messages: List[Dict[str, str]], reasoning_effort: str = "minimal", gpt_model: str = OPENAI_MODEL, context_word: Optional[str] = None, max_retries: int = 5) -> str:
+    base_delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            sys_prompt = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
+            user_prompt = messages[-1]["content"] if messages else ""
+            composed = (sys_prompt + "\n\n" + user_prompt).strip()
+            debug_log(f"attempt_responses: model={gpt_model}, effort={reasoning_effort}")
+            debug_log(f"attempt_responses: sys_len={len(sys_prompt)}, user_len={len(user_prompt)}, composed_len={len(composed)}")
+            resp = client.responses.create(model=gpt_model, input=composed, reasoning={"effort": reasoning_effort})
+            debug_log(f"attempt_responses: raw_response={resp}")
+            text = getattr(resp, "output_text", None) or ""
+            if not text and hasattr(resp, "output"):
+                try:
+                    parts = []
+                    for item in resp.output:  # type: ignore[attr-defined]
+                        if hasattr(item, "content"):
+                            for c in item.content:  # type: ignore[attr-defined]
+                                if hasattr(c, "text") and hasattr(c.text, "value"):
+                                    parts.append(c.text.value)
+                    text = "".join(parts)
+                except Exception:
+                    text = ""
+            debug_log(f"attempt_responses: text_len={len(text) if text else 0}")
+            if text.strip():
+                return text.strip()
+            # Empty response considered transient; fall through to backoff
+        except Exception as e:
+            msg = str(e)
+            # Try to respect suggested wait when present (e.g., "try again in 1.6s")
+            wait_seconds = base_delay * (2 ** attempt)
+            m = re.search(r"try again in\s+([0-9.]+)s", msg, flags=re.IGNORECASE)
+            if m:
+                try:
+                    wait_seconds = float(m.group(1))
+                except Exception:
+                    pass
+            wait_seconds = min(max(0.5, wait_seconds), 10.0)
+            log_event((context_word or "gpt"), "gpt_retry", attempt=attempt + 1, max_retries=max_retries, wait_seconds=wait_seconds, model=gpt_model, error=msg[:500])
+            debug_log(f"attempt_responses: retry attempt={attempt + 1} wait={wait_seconds}s reason={msg}")
+            time.sleep(wait_seconds)
+            continue
+        # No exception but empty text, wait then retry
+        wait_seconds = min(base_delay * (2 ** attempt), 5.0)
+        log_event((context_word or "gpt"), "gpt_empty_retry", attempt=attempt + 1, wait_seconds=wait_seconds, model=gpt_model)
+        time.sleep(wait_seconds)
+    debug_log("attempt_responses: exhausted retries")
+    log_event((context_word or "gpt"), "gpt_exhausted_retries", max_retries=max_retries, model=gpt_model)
+    return ""
 
 
 
@@ -432,12 +504,18 @@ def compute_desired_counts(word: str, phrases: List[str]) -> Dict[str, int]:
         counts[p] = desired
     return counts
 
-def gather_all_rows(word: str, gpt_examples: Dict[str, List[str]], defs: Dict[str, str]) -> List[Tuple[str, str]]:
+def gather_all_rows(word: str, gpt_examples: Dict[str, List[str]], defs: Dict[str, str], contexts: Optional[Dict[str, List[str]]] = None) -> List[Tuple[str, str]]:
     rows: List[Tuple[str, str]] = []
+    per_collocation_row_counts: Dict[str, int] = {}
     for phrase, examples in gpt_examples.items():
         label = collocation_label(phrase, word)
         definition = defs.get(phrase, "")
         back = f"{label} — {definition}".strip().rstrip(" —")
+        ctx_labels = [] if not contexts else contexts.get(phrase, [])
+        if ctx_labels:
+            ctx_str = " | ".join([c for c in ctx_labels if isinstance(c, str) and c.strip()])
+            if ctx_str:
+                back = f"{back} || {ctx_str}"
 
         # Preposition collocations: full chunk (contiguous) else lemma fallback
         if is_prep_collocation(phrase):
@@ -447,6 +525,7 @@ def gather_all_rows(word: str, gpt_examples: Dict[str, List[str]], defs: Dict[st
                 if not wrapped:
                     wrapped = html_line_to_cloze_text(html_line, word)
                 rows.append((wrapped, back))
+                per_collocation_row_counts[phrase] = per_collocation_row_counts.get(phrase, 0) + 1
             continue
 
         # Two-word content collocations: split 6 examples → 3 lemma, 3 partner
@@ -461,6 +540,7 @@ def gather_all_rows(word: str, gpt_examples: Dict[str, List[str]], defs: Dict[st
 
             for html_line in lemma_examples:
                 rows.append((html_line_to_cloze_text(html_line, word), back))
+                per_collocation_row_counts[phrase] = per_collocation_row_counts.get(phrase, 0) + 1
 
             tokens = tokenize_phrase(phrase)
             t1, t2 = tokens
@@ -472,23 +552,27 @@ def gather_all_rows(word: str, gpt_examples: Dict[str, List[str]], defs: Dict[st
                     sent = plain_text_from_html_line(html_line)
                     row = re.sub(rf"\b{re.escape(partner)}\b", lambda m: f"{{{{c1::{m.group(0)}}}}}", sent, flags=re.IGNORECASE, count=1)
                     rows.append((row, back))
+                    per_collocation_row_counts[phrase] = per_collocation_row_counts.get(phrase, 0) + 1
             continue
 
         # Other types: lemma-only for all provided examples
         for html_line in examples:
             rows.append((html_line_to_cloze_text(html_line, word), back))
+            per_collocation_row_counts[phrase] = per_collocation_row_counts.get(phrase, 0) + 1
 
+    log_event(word, "rows_built", total_rows=len(rows), per_collocation_counts=per_collocation_row_counts)
     return rows
 
 
-def write_all_cards_csv(word: str, gpt_examples: Dict[str, List[str]], defs: Dict[str, str], output_dir: str) -> str:
+def write_all_cards_csv(word: str, gpt_examples: Dict[str, List[str]], defs: Dict[str, str], output_dir: str, contexts: Optional[Dict[str, List[str]]] = None) -> str:
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"anki_cloze_{word}.csv")
-    rows = gather_all_rows(word, gpt_examples, defs)
+    rows = gather_all_rows(word, gpt_examples, defs, contexts)
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         for front, back in rows:
             writer.writerow([front, back])
+    log_event(word, "write_cards_csv", rows=len(rows), path=out_path)
     return out_path
 
 
@@ -595,6 +679,7 @@ Return ONLY a JSON object where each key is a collocation string from the input 
 - reason: string ("british" | "formal" | "")
 - definition: string (5–15 words, plain-English core meaning, no examples or extra context)
 - sentences: array of strings (exactly the number requested for that collocation when denied=false; [] when denied=true)
+- contexts: array of short labels (strings) describing typical usage contexts/registers/media for the collocation (e.g., workplace, university, informal conversation, legal documents, news, social media, TV ads). Use your own taxonomy; avoid duplicates; keep each label concise (1–3 words). Do not add explanations. If the collocation is used everywhere - you can just return "everywhere"
 
 Meanings/guidance for denial:
 - British (reason="british"): characteristically British (e.g., "take a decision").
@@ -627,16 +712,18 @@ Quality control before returning:
     ]
 
 
-def generate_examples_and_definitions(word: str, collocations: List[Tuple[str, int, Optional[str]]]) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+def generate_examples_and_definitions(word: str, collocations: List[Tuple[str, int, Optional[str]]]) -> Tuple[Dict[str, List[str]], Dict[str, str], Dict[str, List[str]]]:
     if OpenAI is None or not collocations or not OPENAI_API_KEY:
         debug_log(f"generate_examples_and_definitions: skipping. OpenAI_present={OpenAI is not None}, collocations={len(collocations)}, has_api_key={bool(OPENAI_API_KEY)}")
-        return {}, {}
+        log_event(word, "gpt_examples_skipped", openai_present=OpenAI is not None, collocations=len(collocations), has_api_key=bool(OPENAI_API_KEY))
+        return {}, {}, {}
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     # Prepare mappings and desired counts
     orig_phrases: List[str] = [p for p, _, _ in collocations]
     desired_counts = compute_desired_counts(word, orig_phrases)
     debug_log(f"generate_examples_and_definitions: num_phrases={len(orig_phrases)}, desired_total={sum(desired_counts.values())}")
+    log_event(word, "gpt_examples_request", num_phrases=len(orig_phrases), desired_total=sum(desired_counts.values()), desired_counts=desired_counts)
 
     # Normalize phrases (e.g., strip '.lemma' markers)
     orig_to_norm: Dict[str, str] = {p: normalize_collocation_phrase(word, p) for p in orig_phrases}
@@ -653,28 +740,32 @@ def generate_examples_and_definitions(word: str, collocations: List[Tuple[str, i
     # Single batched call 
     messages = build_examples_defs_prompt(word, norm_to_count)
     debug_log(f"generate_examples_and_definitions: model={OPENAI_MODEL}, sys_len={len(messages[0]['content']) if messages else 0}, user_len={len(messages[-1]['content']) if messages else 0}")
-    text = attempt_responses(client, messages, reasoning_effort="minimal")
+    text = attempt_responses(client, messages, reasoning_effort="minimal", context_word=word)
     debug_log(f"generate_examples_and_definitions: response text_len={len(text) if text else 0}")
 
     examples: Dict[str, List[str]] = {}
     defs: Dict[str, str] = {}
+    contexts_map: Dict[str, List[str]] = {}
 
     if not text:
         debug_log("generate_examples_and_definitions: empty text, returning no examples/defs")
-        return examples, defs
+        log_event(word, "gpt_examples_empty_response")
+        return examples, defs, contexts_map
 
     try:
-        import json
         data = json.loads(text)
         if not isinstance(data, dict):
             debug_log("generate_examples_and_definitions: JSON was not an object")
-            return examples, defs
+            log_event(word, "gpt_examples_malformed_json")
+            return examples, defs, contexts_map
         produced_before = 0
         produced_after = 0
         ok_collocs = 0
         denied_total = 0
         denied_british = 0
         denied_formal = 0
+        denied_list: List[Tuple[str, str]] = []
+        contexts_total = 0
         for norm_phrase, payload in data.items():
             if not isinstance(payload, dict):
                 continue
@@ -682,6 +773,7 @@ def generate_examples_and_definitions(word: str, collocations: List[Tuple[str, i
             definition = payload.get("definition")
             denied_flag = bool(payload.get("denied", False))
             reason_val = str(payload.get("reason", "")).strip().lower()
+            raw_contexts = payload.get("contexts")
             if not isinstance(norm_phrase, str):
                 continue
             orig_phrase = norm_to_orig.get(norm_phrase, None)
@@ -694,6 +786,18 @@ def generate_examples_and_definitions(word: str, collocations: List[Tuple[str, i
             if not orig_phrase:
                 continue
 
+            # Capture contexts (even if denied), without deduplication or capping
+            contexts_list: List[str] = []
+            if isinstance(raw_contexts, list):
+                for c in raw_contexts:
+                    if isinstance(c, str):
+                        ctx = c.strip()
+                        if ctx:
+                            contexts_list.append(ctx)
+            if contexts_list:
+                contexts_map[orig_phrase] = contexts_list
+                contexts_total += len(contexts_list)
+
             # If denied by the model, skip producing outputs
             if denied_flag or reason_val in ("british", "formal"):
                 denied_total += 1
@@ -701,6 +805,7 @@ def generate_examples_and_definitions(word: str, collocations: List[Tuple[str, i
                     denied_british += 1
                 elif reason_val == "formal":
                     denied_formal += 1
+                denied_list.append((orig_phrase, reason_val or "denied"))
                 # Do not include examples/defs for denied collocations
                 continue
 
@@ -716,14 +821,29 @@ def generate_examples_and_definitions(word: str, collocations: List[Tuple[str, i
                 examples[orig_phrase] = out_sents[:desired]
             if isinstance(definition, str) and definition.strip():
                 defs[orig_phrase] = definition.strip()
-        debug_log(
-            f"generate_examples_and_definitions: collocs_with_examples={ok_collocs}, sents_before_validation={produced_before}, sents_after_validation={produced_after}, defs={len(defs)}, denied_total={denied_total}, denied_british={denied_british}, denied_formal={denied_formal}"
+        log_event(
+            word,
+            "gpt_examples_summary",
+            collocs_requested=len(orig_phrases),
+            collocs_with_examples=ok_collocs,
+            sents_before_validation=produced_before,
+            sents_after_validation=produced_after,
+            defs=len(defs),
+            denied_total=denied_total,
+            denied_british=denied_british,
+            denied_formal=denied_formal,
+            denied=denied_list,
+            contexts_phrases=len(contexts_map),
+            contexts_total=contexts_total,
         )
+        if contexts_map:
+            log_event(word, "gpt_contexts", contexts=contexts_map)
     except Exception as e:
         debug_log(f"generate_examples_and_definitions: JSON parse/processing error: {e}")
-        return examples, defs
+        log_event(word, "gpt_examples_error", error=str(e))
+        return examples, defs, contexts_map
 
-    return examples, defs
+    return examples, defs, contexts_map
 
 
 def strip_dot_markers_from_collocations(word: str, collocations: List[Tuple[str, int, Optional[str]]]) -> List[Tuple[str, int, Optional[str]]]:
@@ -779,12 +899,14 @@ def main() -> None:
     exit_code = 0
     try:
         # Run and then write per-word artifacts
+        log_event(word, "word_start")
         collocations, rows = run_pipeline_collect(word)
         colloc_out_dir = "./outputs"
         out_txt = write_collocations_to_file(word, collocations, colloc_out_dir)
         print(f"[{word}] Wrote {len(collocations)} collocations (freq>200) to: {out_txt}")
         out_csv = write_rows_csv(word, rows, colloc_out_dir)
         print(f"[{word}] Wrote All Anki Cloze Cards CSV to: {out_csv}")
+        log_event(word, "word_done", collocations=len(collocations), rows=len(rows), txt_path=out_txt, csv_path=out_csv)
     except requests.HTTPError as e:
         print(f"HTTP error: {e}", file=sys.stderr)
         exit_code = 2
@@ -836,9 +958,12 @@ def _derive_batch_paths(word_file_path: str) -> Tuple[str, str]:
 
 def _runner_collect(w: str) -> Tuple[str, bool, str, List[Tuple[str, int, Optional[str]]], List[Tuple[str, str]]]:
     try:
+        log_event(w, "word_start")
         collocations, rows = run_pipeline_collect(w)
+        log_event(w, "word_done", collocations=len(collocations), rows=len(rows))
         return (w, True, "ok", collocations, rows)
     except Exception as e:  # pragma: no cover (child process)
+        log_event(w, "word_fail", error=str(e))
         return (w, False, str(e), [], [])
 
 
@@ -858,20 +983,28 @@ def _process_words_in_parallel(words: List[str], max_workers: int, word_file_pat
                 if not ok:
                     failures.append((w, msg))
                     print(f"[FAIL] {w}: {msg}", file=sys.stderr)
+                    log_event(w, "batch_word_fail", error=msg)
                 else:
                     per_word_results[w] = (collocs, rows)
                     print(f"[DONE] {w}")
+                    log_event(w, "batch_word_done", collocations=len(collocs), rows=len(rows))
             except Exception as e:  # pragma: no cover
                 failures.append((w, str(e)))
                 print(f"[FAIL] {w}: {e}", file=sys.stderr)
+                log_event(w, "batch_word_fail", error=str(e))
 
     # Write aggregated outputs
     csv_path, txt_path = _derive_batch_paths(word_file_path)
     _write_batch_csv(words, per_word_results, csv_path)
     _write_batch_collocations_txt(words, per_word_results, txt_path)
 
+    # Write concise batch summary for quick manual verification
+    summary_path = _write_batch_summary(words, per_word_results, failures, csv_path, txt_path, word_file_path)
+
     print(f"Wrote batch CSV: {csv_path}")
     print(f"Wrote batch collocations TXT: {txt_path}")
+    print(f"Wrote batch summary: {summary_path}")
+    log_event("batch", "batch_done", words=len(words), csv_path=csv_path, txt_path=txt_path, failures=len(failures))
 
     if failures:
         print(f"Completed with {len(failures)} failures:")
@@ -893,6 +1026,7 @@ def _write_batch_csv(words: List[str], results: Dict[str, Tuple[List[Tuple[str, 
         writer = csv.writer(f)
         for front, back in rows_flat:
             writer.writerow([front, back])
+    log_event("batch", "write_batch_csv", rows=len(rows_flat), path=out_path)
 
 
 def _write_batch_collocations_txt(words: List[str], results: Dict[str, Tuple[List[Tuple[str, int, Optional[str]]], List[Tuple[str, str]]]], out_path: str) -> None:
@@ -913,6 +1047,44 @@ def _write_batch_collocations_txt(words: List[str], results: Dict[str, Tuple[Lis
             f.write(f"{w}\n")  # header line
             for phrase, frequency, _ in collocs_sorted:
                 f.write(f"{phrase}\t{frequency}\n")
+    log_event("batch", "write_batch_collocations_txt", path=out_path)
+
+
+def _write_batch_summary(words: List[str], results: Dict[str, Tuple[List[Tuple[str, int, Optional[str]]], List[Tuple[str, str]]]], failures: List[Tuple[str, str]], csv_path: str, txt_path: str, word_file_path: str) -> str:
+    base = os.path.splitext(os.path.basename(word_file_path))[0] or "batch"
+    out_dir = "./outputs"
+    os.makedirs(out_dir, exist_ok=True)
+    summary_path = os.path.join(out_dir, f"batch_summary_{base}.txt")
+
+    # Map failures for quick lookup
+    fail_map: Dict[str, str] = {w: msg for w, msg in failures}
+
+    ok_count = len(results)
+    fail_count = len(failures)
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(f"Words: {len(words)}; OK: {ok_count}; FAIL: {fail_count}\n")
+        f.write(f"CSV: {csv_path}\n")
+        f.write(f"Collocations TXT: {txt_path}\n")
+        # Compute expected total rows (sum of per-word rows)
+        total_rows = 0
+        for w in words:
+            pair = results.get(w)
+            if pair:
+                _, rows = pair
+                total_rows += len(rows)
+        f.write(f"Total rows (all words): {total_rows}\n")
+        f.write("\n")
+        for w in words:
+            if w in results:
+                collocs, rows = results[w]
+                f.write(f"{w}\tOK\tcollocations={len(collocs)}\trows={len(rows)}\n")
+            else:
+                msg = fail_map.get(w, "unknown error")
+                f.write(f"{w}\tFAIL\t{msg}\n")
+
+    log_event("batch", "write_batch_summary", path=summary_path, ok=ok_count, fail=fail_count, total_words=len(words))
+    return summary_path
 
 
 # --------------------
@@ -925,6 +1097,7 @@ def run_pipeline_collect(word: str) -> Tuple[List[Tuple[str, int, Optional[str]]
     html = fetch_collocations_page(word)
     collocations = parse_collocations(html)
     debug_log(f"run_pipeline_collect: parsed_collocations={len(collocations)}")
+    log_event(word, "jtw_parsed", parsed=len(collocations))
 
     # Strip dot markers like ".word" and de-duplicate by normalized phrase
     collocations = strip_dot_markers_from_collocations(word, collocations)
@@ -933,10 +1106,11 @@ def run_pipeline_collect(word: str) -> Tuple[List[Tuple[str, int, Optional[str]]
     collocations_all = collocations[:]
     collocations = [c for c in collocations_all if c[1] >= MIN_FREQUENCY]
     debug_log(f"run_pipeline_collect: above_threshold={len(collocations)} of total={len(collocations_all)}")
+    log_event(word, "jtw_threshold", total=len(collocations_all), above_threshold=len(collocations))
 
-    # If we got <= 1 above threshold, take top 2 overall and add target lemma
+    # If we got <= 1 above threshold, take top 1 overall and add target lemma
     if len(collocations) <= 1:
-        collocations = sorted(collocations_all, key=lambda x: -x[1])[:2]
+        collocations = sorted(collocations_all, key=lambda x: -x[1])[:1]
 
     # Now cap to top N by frequency
     collocations = sorted(collocations, key=lambda x: -x[1])[:COLLOCATIONS_LIMIT_PER_WORD]
@@ -947,22 +1121,28 @@ def run_pipeline_collect(word: str) -> Tuple[List[Tuple[str, int, Optional[str]]
     article_forms = {f"a {word.lower()}", f"an {word.lower()}", f"the {word.lower()}"}
     has_article_lemma = any(form in phrases_lower for form in article_forms)
     had_lemma = word.lower() in phrases_lower or has_article_lemma
+    added_lemma = False
     if word.lower() not in phrases_lower and not has_article_lemma:
         collocations.append((word, 999, None))
+        added_lemma = True
     debug_log(f"run_pipeline_collect: lemma_present_before={had_lemma}, after={True}")
+    log_event(word, "jtw_capped", capped=len(collocations), limit=COLLOCATIONS_LIMIT_PER_WORD, lemma_present_before=had_lemma, added_lemma=added_lemma)
 
     if not collocations:
         print("No collocations with frequency > 200 found.")
+        log_event(word, "jtw_no_collocations")
 
     # Filter collocations and generate content
     # filtered_collocations = filter_collocations_with_gpt(word, collocations)
     # debug_log(f"run_pipeline_collect: filtered_collocations={len(filtered_collocations)}")
-    gpt_examples, gpt_definitions = generate_examples_and_definitions(word, collocations)
+    gpt_examples, gpt_definitions, gpt_contexts = generate_examples_and_definitions(word, collocations)
     debug_log(f"run_pipeline_collect: examples_collocs={len(gpt_examples)}, definitions={len(gpt_definitions)}")
+    log_event(word, "gpt_generation_done", example_collocations=len(gpt_examples), definitions=len(gpt_definitions))
 
     # Build rows
-    rows = gather_all_rows(word, gpt_examples, gpt_definitions)
+    rows = gather_all_rows(word, gpt_examples, gpt_definitions, gpt_contexts)
     debug_log(f"run_pipeline_collect: total_rows={len(rows)}")
+    log_event(word, "rows_done", rows=len(rows))
     return collocations, rows
 
 
@@ -974,6 +1154,7 @@ def write_rows_csv(word: str, rows: List[Tuple[str, str]], output_dir: str) -> s
         writer = csv.writer(f)
         for front, back in rows:
             writer.writerow([front, back])
+    log_event(word, "write_rows_csv", rows=len(rows), path=out_path)
     return out_path
 
 
